@@ -1,5 +1,8 @@
+# Suppress TensorFlow oneDNN log message
+import os
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+
 import cv2
-import mediapipe as mp
 import pyautogui
 import speech_recognition as sr
 import threading
@@ -10,6 +13,12 @@ import pyttsx3
 from PIL import Image, ImageTk
 import numpy as np
 from enum import Enum
+
+# MediaPipe 0.10+ uses Tasks API (HandLandmarker) instead of legacy solutions
+from mediapipe.tasks.python.core import base_options as base_options_lib
+from mediapipe.tasks.python.vision import hand_landmarker as mp_hand_landmarker
+from mediapipe.tasks.python.vision.core import vision_task_running_mode
+from mediapipe.tasks.python.vision.core.image import Image as MpImage, ImageFormat
 
 # Prevent PyAutoGUI from moving the mouse to extreme edges
 pyautogui.FAILSAFE = True
@@ -66,20 +75,29 @@ class GestureVoiceControlApp:
         self.is_dragging = False
         self.drag_start_pos = None
         
-        # Speech recognition setup
+        # Speech recognition setup (optional - app works without microphone)
         self.recognizer = sr.Recognizer()
-        self.microphone = sr.Microphone()
+        self.microphone = None
+        try:
+            self.microphone = sr.Microphone()
+        except (AttributeError, OSError) as e:
+            pass  # PyAudio or mic not available; gesture control still works
         self.engine = pyttsx3.init()
         self.engine.setProperty('rate', 150)
         
-        # MediaPipe setup
-        self.mp_hands = mp.solutions.hands
-        self.hands = self.mp_hands.Hands(
-            max_num_hands=1,
-            min_detection_confidence=0.6,  # Lower threshold for better detection
-            min_tracking_confidence=0.6    # Lower threshold for better tracking
+        # MediaPipe 0.10+ HandLandmarker (Tasks API)
+        model_path = self._get_hand_landmarker_model()
+        base_options = base_options_lib.BaseOptions(model_asset_path=model_path)
+        options = mp_hand_landmarker.HandLandmarkerOptions(
+            base_options=base_options,
+            running_mode=vision_task_running_mode.VisionTaskRunningMode.VIDEO,
+            num_hands=1,
+            min_hand_detection_confidence=0.6,
+            min_hand_presence_confidence=0.6,
+            min_tracking_confidence=0.6,
         )
-        self.mp_draw = mp.solutions.drawing_utils
+        self.hands = mp_hand_landmarker.HandLandmarker.create_from_options(options)
+        self._hand_connections = mp_hand_landmarker.HandLandmarksConnections.HAND_CONNECTIONS
         
         # Create UI
         self.create_ui()
@@ -192,6 +210,21 @@ class GestureVoiceControlApp:
         self.log_area = ctk.CTkTextbox(log_frame, height=100, state="disabled")
         self.log_area.pack(fill=tk.X)
     
+    def _get_hand_landmarker_model(self):
+        """Return path to hand_landmarker.task, downloading from Google if needed."""
+        import urllib.request
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        model_path = os.path.join(script_dir, "hand_landmarker.task")
+        if not os.path.isfile(model_path):
+            url = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+            try:
+                urllib.request.urlretrieve(url, model_path)
+            except Exception as e:
+                raise FileNotFoundError(
+                    f"Could not download hand_landmarker.model from {url}. Error: {e}"
+                ) from e
+        return model_path
+    
     def update_smoothing(self, value):
         self.smoothing = int(value)
         
@@ -242,6 +275,10 @@ class GestureVoiceControlApp:
     
     def run_voice_recognition(self):
         """Voice recognition thread"""
+        if self.microphone is None:
+            self.log_message("Microphone not available (install PyAudio for voice control)")
+            self.voice_status.configure(text=VOICE_ERROR)
+            return
         with self.microphone as source:
             self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
         
@@ -332,6 +369,7 @@ class GestureVoiceControlApp:
         """Main tracking thread for hand gesture recognition"""
         last_mode_change_time = time.time() - 1  # Initialize with offset to allow immediate mode change
         mode_change_cooldown = 0.5  # Seconds between mode changes to prevent rapid switching
+        frame_timestamp_ms = 0
         
         while self.running:
             ret, frame = self.cap.read()
@@ -342,12 +380,15 @@ class GestureVoiceControlApp:
             # Flip the frame horizontally for a more intuitive mirror view
             frame = cv2.flip(frame, 1)
             
-            # Convert to RGB for MediaPipe and process for hand detection
+            # Convert to RGB for MediaPipe Tasks API
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = self.hands.process(rgb_frame)
+            rgb_frame = np.ascontiguousarray(rgb_frame)
+            mp_image = MpImage(ImageFormat.SRGB, rgb_frame)
+            frame_timestamp_ms += 33  # ~30 fps in ms
+            results = self.hands.detect_for_video(mp_image, frame_timestamp_ms)
             
-            # Check if hand is detected
-            if not results.multi_hand_landmarks:
+            # Check if hand is detected (Tasks API: hand_landmarks is list of hands)
+            if not results.hand_landmarks:
                 self.handle_no_hand_detected()
                 self.update_canvas(frame)
                 continue
@@ -380,19 +421,24 @@ class GestureVoiceControlApp:
             self.log_message("Drag ended (hand lost)")
     
     def process_hand_landmarks(self, frame, results, last_mode_change_time):
-        """Process detected hand landmarks"""
+        """Process detected hand landmarks (MediaPipe Tasks API format)"""
         # Process only the first detected hand
-        hand_landmarks = results.multi_hand_landmarks[0]
+        hand_landmarks_norm = results.hand_landmarks[0]
+        h, w = frame.shape[0], frame.shape[1]
         
-        # Draw landmarks on frame
-        self.mp_draw.draw_landmarks(
-            frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS)
-        
-        # Extract landmark positions
+        # Convert normalized landmarks to pixel coordinates
         landmarks = []
-        for lm in hand_landmarks.landmark:
-            x, y = int(lm.x * frame.shape[1]), int(lm.y * frame.shape[0])
+        for lm in hand_landmarks_norm:
+            x = int(lm.x * w)
+            y = int(lm.y * h)
             landmarks.append((x, y))
+        
+        # Draw hand connections (skeleton)
+        for conn in self._hand_connections:
+            if conn.start < len(landmarks) and conn.end < len(landmarks):
+                cv2.line(frame, landmarks[conn.start], landmarks[conn.end], (0, 255, 0), 2)
+        for pt in landmarks:
+            cv2.circle(frame, pt, 4, (0, 255, 255), -1)
         
         # Count extended fingers and stabilize
         finger_count = self.count_fingers(landmarks)
@@ -599,6 +645,8 @@ class GestureVoiceControlApp:
         if self.is_dragging:
             pyautogui.mouseUp()
         
+        if getattr(self, 'hands', None) is not None:
+            self.hands.close()
         if self.cap and self.cap.isOpened():
             self.cap.release()
         
