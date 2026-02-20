@@ -1,4 +1,4 @@
-# 🖱️ Gesture & Voice Control Application
+     # 🖱️ Gesture & Voice Control Application
 
 A hand gesture and voice-controlled mouse system that allows users to control their computer using gestures and voice commands.
 
